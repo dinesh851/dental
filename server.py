@@ -1,90 +1,99 @@
-from fastapi import FastAPI, HTTPException, Depends, Query, status
-from pydantic import BaseModel, EmailStr, Field, validator
-from sqlalchemy import create_engine, Column, Integer, String, Date, Time, ForeignKey, Boolean, Text
-from sqlalchemy.orm import sessionmaker, Session, relationship
+# main.py
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Boolean, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
-from datetime import date, time, datetime, timedelta
+from sqlalchemy.orm import sessionmaker, relationship, Session
+from pydantic import BaseModel
 from typing import List, Optional
-import re
-from enum import Enum
+from datetime import datetime, timedelta, UTC  # Added UTC for the utcnow replacement
+
+import random
+import os
+import jwt
+from dotenv import load_dotenv
+import logging
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Database connection
 DATABASE_URL = "postgresql://postgres:dinesh@localhost/dental_clinic"
-
+# DATABASE_URL = "postgresql://postgres:dinesh@db.rvucolufkmfmsrnbchdi.supabase.co:5432/postgres"
 engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Define database models
+# JWT Settings
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+# OAuth2 scheme
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# Database Models
 class Patient(Base):
     __tablename__ = "patients"
     
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(100), nullable=False, index=True)
-    phone_number = Column(String(20), nullable=False)
-    age = Column(Integer, nullable=False)
-    address = Column(String(255), nullable=True)
-    medical_history = Column(Text, nullable=True)
-    insurance_info = Column(String(255), nullable=True)
-    
+    name = Column(String, index=True)
+    mobile_number = Column(String, unique=True, index=True)
+    email = Column(String, nullable=True)
+    address = Column(String, nullable=True)
+    date_of_birth = Column(DateTime, nullable=True)
+    age = Column(Integer, nullable=True)  # Added missing age column
+    gender = Column(String, nullable=True)  # Added missing gender column
+    created_at = Column(DateTime, default=datetime.now)
     appointments = relationship("Appointment", back_populates="patient")
 
+class Admin(Base):
+    __tablename__ = "admins"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    is_superadmin = Column(Boolean, default=False)
+    
 class Doctor(Base):
     __tablename__ = "doctors"
     
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    specialization = Column(String(100), nullable=False)
-    phone_number = Column(String(20), nullable=False)
-    email = Column(String(100), nullable=False)
+    name = Column(String, index=True)
+    specialization = Column(String)
     
     appointments = relationship("Appointment", back_populates="doctor")
-
-class AppointmentStatus(str, Enum):
-    SCHEDULED = "scheduled"
-    CONFIRMED = "confirmed"
-    COMPLETED = "completed"
-    CANCELLED = "cancelled"
-    RESCHEDULED = "rescheduled"
-    NO_SHOW = "no_show"
-
-class AppointmentType(str, Enum):
-    REGULAR_CHECKUP = "regular_checkup"
-    CLEANING = "cleaning"
-    FILLING = "filling"
-    ROOT_CANAL = "root_canal"
-    EXTRACTION = "extraction"
-    ORTHODONTIC = "orthodontic"
-    COSMETIC = "cosmetic"
-    EMERGENCY = "emergency"
-
+    
 class Appointment(Base):
     __tablename__ = "appointments"
     
     id = Column(Integer, primary_key=True, index=True)
-    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False)
-    doctor_id = Column(Integer, ForeignKey("doctors.id"), nullable=False)
-    appointment_date = Column(Date, nullable=False)
-    appointment_time = Column(Time, nullable=False)
-    appointment_type = Column(String(50), nullable=False)
-    reason = Column(Text, nullable=True)
-    status = Column(String(20), default="scheduled")
+    patient_id = Column(Integer, ForeignKey("patients.id"))
+    doctor_id = Column(Integer, ForeignKey("doctors.id"))
+    appointment_datetime = Column(DateTime)
+    status = Column(String, default="scheduled")  # scheduled, completed, cancelled
     notes = Column(Text, nullable=True)
-    created_at = Column(String, default=lambda: datetime.now().isoformat())
-    updated_at = Column(String, default=lambda: datetime.now().isoformat(), 
-                        onupdate=lambda: datetime.now().isoformat())
-    
+    created_at = Column(DateTime, default=datetime.now)
+    slots = int
     patient = relationship("Patient", back_populates="appointments")
     doctor = relationship("Doctor", back_populates="appointments")
+    
+class OTP(Base):
+    __tablename__ = "otps"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    mobile_number = Column(String, index=True)
+    otp = Column(String)
+    is_verified = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.now)
+    expires_at = Column(DateTime)
 
-# Create tables in the database
+# Create all tables
 Base.metadata.create_all(bind=engine)
-
-# FastAPI App
-app = FastAPI(title="Dental Clinic Appointment System", 
-              description="API for managing dental appointment bookings",
-              version="1.0.0")
 
 # Dependency to get DB session
 def get_db():
@@ -94,345 +103,452 @@ def get_db():
     finally:
         db.close()
 
-# Pydantic Models for API
-class PatientBase(BaseModel):
-    name: str = Field(..., min_length=2, max_length=100, example="John Doe")
-    email: EmailStr = Field(..., example="john.doe@example.com")
-    phone_number: str = Field(..., example="555-123-4567")
-    age: int = Field(..., gt=0, lt=120, example=35)
-    address: Optional[str] = Field(None, example="123 Main St, City, State 12345")
-    medical_history: Optional[str] = Field(None, example="No allergies, diabetes type 2")
-    insurance_info: Optional[str] = Field(None, example="Blue Cross Blue Shield #12345678")
+# Pydantic models for request/response
+class PatientCreate(BaseModel):
+    name: str
+    mobile_number: str
+    email: Optional[str] = None
+    address: Optional[str] = None
+    date_of_birth: Optional[datetime] = None
 
-    @validator('phone_number')
-    def validate_phone_number(cls, v):
-        pattern = r'^\+?[0-9\-\(\) ]{10,20}$'
-        if not re.match(pattern, v):
-            raise ValueError('Invalid phone number format')
-        return v
-
-class PatientCreate(PatientBase):
-    pass
-
-class PatientResponse(PatientBase):
+class PatientResponse(BaseModel):
     id: int
+    name: str
+    mobile_number: str
+    email: Optional[str] = None
+    address: Optional[str] = None
+    date_of_birth: Optional[datetime] = None
+    created_at: datetime
     
     class Config:
         orm_mode = True
 
-class DoctorBase(BaseModel):
-    name: str = Field(..., min_length=2, max_length=100)
-    specialization: str
-    phone_number: str
-    email: EmailStr
-
-class DoctorCreate(DoctorBase):
-    pass
-
-class DoctorResponse(DoctorBase):
-    id: int
-    
-    class Config:
-        orm_mode = True
-
-class AppointmentBase(BaseModel):
-    patient_id: int
+class AppointmentCreate(BaseModel):
     doctor_id: int
-    appointment_date: date
-    appointment_time: time
-    appointment_type: AppointmentType
-    reason: Optional[str] = None
+    appointment_datetime: datetime
     notes: Optional[str] = None
 
-    @validator('appointment_date')
-    def validate_date(cls, v):
-        if v < date.today():
-            raise ValueError('Appointment date cannot be in the past')
-        return v
-
-class AppointmentCreate(AppointmentBase):
-    pass
-
-class AppointmentUpdate(BaseModel):
-    appointment_date: Optional[date] = None
-    appointment_time: Optional[time] = None
-    doctor_id: Optional[int] = None
-    appointment_type: Optional[AppointmentType] = None
-    reason: Optional[str] = None
-    status: Optional[AppointmentStatus] = None
-    notes: Optional[str] = None
-
-class AppointmentResponse(AppointmentBase):
+class AppointmentResponse(BaseModel):
     id: int
-    status: AppointmentStatus
-    created_at: str
-    updated_at: str
+    doctor_id: int
+    patient_id: int
+    appointment_datetime: datetime
+    status: str
+    notes: Optional[str] = None
+    created_at: datetime
     
     class Config:
         orm_mode = True
 
-class AppointmentWithDetails(AppointmentResponse):
-    patient: PatientResponse
-    doctor: DoctorResponse
+class DoctorResponse(BaseModel):
+    id: int
+    name: str
+    specialization: str
     
     class Config:
         orm_mode = True
 
-class Message(BaseModel):
-    message: str
+class AdminCreate(BaseModel):
+    username: str
+    password: str
+    is_superadmin: bool = False
 
-# API Endpoints for Patients
-@app.post("/patients/", response_model=PatientResponse, status_code=status.HTTP_201_CREATED)
-def create_patient(patient: PatientCreate, db: Session = Depends(get_db)):
-    # Check if patient with email already exists
-    existing_patient = db.query(Patient).filter(Patient.email == patient.email).first()
-    if existing_patient:
-        raise HTTPException(status_code=400, detail="Email already registered")
+class OTPRequest(BaseModel):
+    mobile_number: str
+
+class OTPVerify(BaseModel):
+    mobile_number: str
+    otp: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user_data: PatientResponse
+
+# Helper functions
+def generate_otp():
+    """Generate a 6-digit OTP"""
+    return str(random.randint(100000, 999999))
+
+def send_otp(mobile_number: str, otp: str):
+    """Mock function to send OTP to mobile number"""
+    # In a real scenario, you would integrate with an SMS gateway
+    logger.info(f"Sending OTP {otp} to {mobile_number}")
+    return True
+
+def verify_patient(db: Session, mobile_number: str, otp: str):
+    """Verify patient with OTP"""
+    db_otp = db.query(OTP).filter(
+        OTP.mobile_number == mobile_number,
+        OTP.otp == otp,
+        OTP.expires_at > datetime.now(),
+        OTP.is_verified == False
+    ).first()
     
-    db_patient = Patient(**patient.dict())
-    db.add(db_patient)
+    if not db_otp:
+        return False
+    
+    db_otp.is_verified = True
     db.commit()
-    db.refresh(db_patient)
-    return db_patient
+    return True
 
-@app.get("/patients/", response_model=List[PatientResponse])
-def get_patients(
-    skip: int = 0, 
-    limit: int = 100, 
-    name: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    query = db.query(Patient)
-    if name:
-        query = query.filter(Patient.name.ilike(f"%{name}%"))
-    return query.offset(skip).limit(limit).all()
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    """Create JWT token"""
+    to_encode = data.copy()
+    
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
-@app.get("/patients/{patient_id}", response_model=PatientResponse)
-def get_patient(patient_id: int, db: Session = Depends(get_db)):
-    patient = db.query(Patient).filter(Patient.id == patient_id).first()
+async def get_current_patient(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    """Get current authenticated patient"""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])  # Changed to pyjwt
+        mobile_number: str = payload.get("sub")
+        if mobile_number is None:
+            raise credentials_exception
+    except jwt.PyJWTError:  # Changed exception class
+        raise credentials_exception
+        
+    patient = db.query(Patient).filter(Patient.mobile_number == mobile_number).first()
     if patient is None:
-        raise HTTPException(status_code=404, detail="Patient not found")
+        raise credentials_exception
+        
     return patient
+async def get_current_admin(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    """Get current authenticated admin"""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None or payload.get("is_admin") is not True:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+        
+    admin = db.query(Admin).filter(Admin.username == username).first()
+    if admin is None:
+        raise credentials_exception
+        
+    return admin
 
-@app.put("/patients/{patient_id}", response_model=PatientResponse)
-def update_patient(patient_id: int, patient: PatientBase, db: Session = Depends(get_db)):
-    db_patient = db.query(Patient).filter(Patient.id == patient_id).first()
-    if db_patient is None:
-        raise HTTPException(status_code=404, detail="Patient not found")
+# FastAPI app
+app = FastAPI(title="Doctor Appointment API")
+
+# Authentication endpoints
+@app.post("/send-otp/", status_code=status.HTTP_200_OK)
+def request_otp(otp_request: OTPRequest, db: Session = Depends(get_db)):
+    """Send OTP to patient's mobile number"""
+    mobile_number = otp_request.mobile_number
     
-    # Update patient details
-    for key, value in patient.dict().items():
-        setattr(db_patient, key, value)
+    # Generate OTP
+    otp = generate_otp()
+    expires_at = datetime.now() + timedelta(minutes=10)
     
+    # Store OTP in database
+    db_otp = OTP(
+        mobile_number=mobile_number,
+        otp=otp,
+        expires_at=expires_at
+    )
+    db.add(db_otp)
     db.commit()
-    db.refresh(db_patient)
-    return db_patient
-
-@app.delete("/patients/{patient_id}", response_model=Message)
-def delete_patient(patient_id: int, db: Session = Depends(get_db)):
-    db_patient = db.query(Patient).filter(Patient.id == patient_id).first()
-    if db_patient is None:
-        raise HTTPException(status_code=404, detail="Patient not found")
     
-    # Check if patient has appointments before deletion
-    appointments = db.query(Appointment).filter(Appointment.patient_id == patient_id).all()
-    if appointments:
+    # Send OTP
+    send_otp(mobile_number, otp)
+    
+    return {"message": "OTP sent successfully", "mobile_number": mobile_number}
+
+@app.post("/login/", response_model=Token)
+def login(otp_verify: OTPVerify, db: Session = Depends(get_db)):
+    """Verify OTP and login patient"""
+    mobile_number = otp_verify.mobile_number
+    otp = otp_verify.otp
+    
+    # Verify OTP
+    if not verify_patient(db, mobile_number, otp):
         raise HTTPException(
-            status_code=400, 
-            detail="Cannot delete patient with existing appointments. Cancel appointments first."
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid OTP or OTP expired",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     
-    db.delete(db_patient)
-    db.commit()
-    return {"message": "Patient deleted successfully"}
+    # Check if patient exists
+    patient = db.query(Patient).filter(Patient.mobile_number == mobile_number).first()
+    
+    # If patient doesn't exist, create a new one with minimal information
+    if not patient:
+        patient = Patient(mobile_number=mobile_number, name=f"Patient-{mobile_number}")
+        db.add(patient)
+        db.commit()
+        db.refresh(patient)
+    
+    # Create access token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": mobile_number},
+        expires_delta=access_token_expires,
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_data": patient
+    }
 
-# API Endpoints for Doctors
-@app.post("/doctors/", response_model=DoctorResponse, status_code=status.HTTP_201_CREATED)
-def create_doctor(doctor: DoctorCreate, db: Session = Depends(get_db)):
-    db_doctor = Doctor(**doctor.dict())
-    db.add(db_doctor)
-    db.commit()
-    db.refresh(db_doctor)
-    return db_doctor
-
-@app.get("/doctors/", response_model=List[DoctorResponse])
-def get_doctors(
-    skip: int = 0, 
-    limit: int = 100, 
-    specialization: Optional[str] = None,
+# Patient endpoints
+@app.put("/patients/update", response_model=PatientResponse)
+def update_patient(
+    patient_data: PatientCreate,
+    current_patient: Patient = Depends(get_current_patient),
     db: Session = Depends(get_db)
 ):
-    query = db.query(Doctor)
-    if specialization:
-        query = query.filter(Doctor.specialization.ilike(f"%{specialization}%"))
-    return query.offset(skip).limit(limit).all()
-
-# API Endpoints for Appointments
-@app.post("/appointments/", response_model=AppointmentResponse, status_code=status.HTTP_201_CREATED)
-def create_appointment(appointment: AppointmentCreate, db: Session = Depends(get_db)):
-    # Check if patient exists
-    patient = db.query(Patient).filter(Patient.id == appointment.patient_id).first()
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
+    """Update patient profile"""
+    # Update patient information
+    current_patient.name = patient_data.name
+    if patient_data.email:
+        current_patient.email = patient_data.email
+    if patient_data.address:
+        current_patient.address = patient_data.address
+    if patient_data.date_of_birth:
+        current_patient.date_of_birth = patient_data.date_of_birth
     
+    db.commit()
+    db.refresh(current_patient)
+    
+    return current_patient
+
+@app.get("/home_user", response_model=PatientResponse)
+def homeuser(current_patient: Patient = Depends(get_current_patient), db: Session = Depends(get_db)):
+    patient = db.query(Patient).filter(Patient.id == current_patient.id).first()
+    appointments = db.query(Appointment).filter(Appointment.patient_id == current_patient.id).all()
+    return {"patient": patient, "appointments": appointments}
+
+
+
+
+@app.get("/patient/me", response_model=PatientResponse)
+def get_patient_profile(current_patient: Patient = Depends(get_current_patient)):
+    """Get current patient profile"""
+    return current_patient
+
+# Appointment endpoints
+@app.post("/appointments/", response_model=AppointmentResponse)
+def create_appointment(
+    appointment: AppointmentCreate,
+    current_patient: Patient = Depends(get_current_patient),
+    db: Session = Depends(get_db)
+):
+    """Create a new appointment for the current patient"""
     # Check if doctor exists
     doctor = db.query(Doctor).filter(Doctor.id == appointment.doctor_id).first()
     if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Doctor not found"
+        )
     
-    # Check if the appointment time is available
-    existing_appointment = db.query(Appointment).filter(
-        Appointment.doctor_id == appointment.doctor_id,
-        Appointment.appointment_date == appointment.appointment_date,
-        Appointment.appointment_time == appointment.appointment_time,
-        Appointment.status.in_(["scheduled", "confirmed"])
-    ).first()
+    # Create appointment
+    db_appointment = Appointment(
+        patient_id=current_patient.id,
+        doctor_id=appointment.doctor_id,
+        appointment_datetime=appointment.appointment_datetime,
+        notes=appointment.notes
+    )
     
-    if existing_appointment:
-        raise HTTPException(status_code=400, detail="This time slot is already booked")
-    
-    # Business hours check (assuming clinic is open 9 AM to 5 PM)
-    appointment_datetime = datetime.combine(appointment.appointment_date, appointment.appointment_time)
-    if appointment_datetime.time() < time(9, 0) or appointment_datetime.time() > time(17, 0):
-        raise HTTPException(status_code=400, detail="Appointments must be during business hours (9 AM to 5 PM)")
-    
-    # Weekend check (assuming clinic is closed on weekends)
-    if appointment_datetime.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
-        raise HTTPException(status_code=400, detail="Appointments cannot be scheduled on weekends")
-    
-    db_appointment = Appointment(**appointment.dict())
     db.add(db_appointment)
     db.commit()
     db.refresh(db_appointment)
+    
     return db_appointment
 
-@app.get("/appointments/", response_model=List[AppointmentWithDetails])
-def get_appointments(
-    skip: int = 0, 
-    limit: int = 100, 
-    date_from: Optional[date] = None,
-    date_to: Optional[date] = None,
-    patient_id: Optional[int] = None,
-    doctor_id: Optional[int] = None,
-    status: Optional[AppointmentStatus] = None,
+@app.get("/appointments/", response_model=List[AppointmentResponse])
+def get_patient_appointments(
+    current_patient: Patient = Depends(get_current_patient),
     db: Session = Depends(get_db)
 ):
-    query = db.query(Appointment)
-    
-    if date_from:
-        query = query.filter(Appointment.appointment_date >= date_from)
-    if date_to:
-        query = query.filter(Appointment.appointment_date <= date_to)
-    if patient_id:
-        query = query.filter(Appointment.patient_id == patient_id)
-    if doctor_id:
-        query = query.filter(Appointment.doctor_id == doctor_id)
-    if status:
-        query = query.filter(Appointment.status == status)
-    
-    return query.offset(skip).limit(limit).all()
+    """Get all appointments for the current patient"""
+    appointments = db.query(Appointment).filter(Appointment.patient_id == current_patient.id).all()
+    return appointments
 
-@app.get("/appointments/{appointment_id}", response_model=AppointmentWithDetails)
-def get_appointment(appointment_id: int, db: Session = Depends(get_db)):
-    appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
-    if appointment is None:
-        raise HTTPException(status_code=404, detail="Appointment not found")
+@app.get("/appointments/{appointment_id}", response_model=AppointmentResponse)
+def get_appointment(
+    appointment_id: int,
+    current_patient: Patient = Depends(get_current_patient),
+    db: Session = Depends(get_db)
+):
+    """Get a specific appointment for the current patient"""
+    appointment = db.query(Appointment).filter(
+        Appointment.id == appointment_id,
+        Appointment.patient_id == current_patient.id
+    ).first()
+    
+    if not appointment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Appointment not found"
+        )
+    
     return appointment
 
-@app.put("/appointments/{appointment_id}", response_model=AppointmentResponse)
-def update_appointment(appointment_id: int, appointment: AppointmentUpdate, db: Session = Depends(get_db)):
-    db_appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
-    if db_appointment is None:
-        raise HTTPException(status_code=404, detail="Appointment not found")
-    
-    # Update only the fields that are provided
-    update_data = appointment.dict(exclude_unset=True)
-    
-    # If we're updating date or time, check for conflicts
-    if "appointment_date" in update_data or "appointment_time" in update_data:
-        new_date = update_data.get("appointment_date", db_appointment.appointment_date)
-        new_time = update_data.get("appointment_time", db_appointment.appointment_time)
-        doctor_id = update_data.get("doctor_id", db_appointment.doctor_id)
-        
-        # Check for time conflicts
-        existing_appointment = db.query(Appointment).filter(
-            Appointment.doctor_id == doctor_id,
-            Appointment.appointment_date == new_date,
-            Appointment.appointment_time == new_time,
-            Appointment.id != appointment_id,
-            Appointment.status.in_(["scheduled", "confirmed"])
-        ).first()
-        
-        if existing_appointment:
-            raise HTTPException(status_code=400, detail="This time slot is already booked")
-    
-    for key, value in update_data.items():
-        setattr(db_appointment, key, value)
-    
-    # Update the updated_at timestamp
-    db_appointment.updated_at = datetime.now().isoformat()
-    
-    db.commit()
-    db.refresh(db_appointment)
-    return db_appointment
-
-@app.patch("/appointments/{appointment_id}/cancel", response_model=AppointmentResponse)
-def cancel_appointment(appointment_id: int, db: Session = Depends(get_db)):
-    db_appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
-    if db_appointment is None:
-        raise HTTPException(status_code=404, detail="Appointment not found")
-    
-    if db_appointment.status == "completed":
-        raise HTTPException(status_code=400, detail="Cannot cancel a completed appointment")
-    
-    db_appointment.status = "cancelled"
-    db_appointment.updated_at = datetime.now().isoformat()
-    
-    db.commit()
-    db.refresh(db_appointment)
-    return db_appointment
-
-@app.get("/available-slots/", response_model=List[dict])
-def get_available_slots(
-    doctor_id: int = Query(..., description="Doctor ID to check availability for"),
-    date: date = Query(..., description="Date to check availability for"),
+@app.put("/appointments/{appointment_id}/cancel")
+def cancel_appointment(
+    appointment_id: int,
+    current_patient: Patient = Depends(get_current_patient),
     db: Session = Depends(get_db)
 ):
-    # Check if doctor exists
-    doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor not found")
+    """Cancel a specific appointment"""
+    appointment = db.query(Appointment).filter(
+        Appointment.id == appointment_id,
+        Appointment.patient_id == current_patient.id
+    ).first()
     
-    # Get all booked appointments for this doctor on the given date
-    booked_slots = db.query(Appointment).filter(
-        Appointment.doctor_id == doctor_id,
-        Appointment.appointment_date == date,
-        Appointment.status.in_(["scheduled", "confirmed"])
-    ).all()
+    if not appointment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Appointment not found"
+        )
     
-    # Create a set of booked times
-    booked_times = {appointment.appointment_time for appointment in booked_slots}
+    appointment.status = "cancelled"
+    db.commit()
     
-    # Generate all possible time slots (assuming 30-minute appointments from 9 AM to 5 PM)
-    all_slots = []
-    current_time = datetime.combine(date, time(9, 0))
-    end_time = datetime.combine(date, time(17, 0))
-    
-    while current_time < end_time:
-        slot_time = current_time.time()
-        if slot_time not in booked_times:
-            all_slots.append({
-                "time": slot_time.strftime("%H:%M"),
-                "doctor_id": doctor_id,
-                "doctor_name": doctor.name,
-                "available": True
-            })
-        
-        current_time += timedelta(minutes=30)
-    
-    return all_slots
+    return {"message": "Appointment cancelled successfully"}
 
-# Root endpoint
-@app.get("/", response_model=Message)
-def root():
-    return {"message": "Welcome to the Dental Clinic Appointment Booking API"}
+# Doctor endpoints
+@app.get("/doctors/", response_model=List[DoctorResponse])
+def get_all_doctors(db: Session = Depends(get_db)):
+    """Get all doctors"""
+    doctors = db.query(Doctor).all()
+    return doctors
+
+# Admin endpoints
+@app.post("/admin/create")
+def create_admin(
+    admin_data: AdminCreate,
+    db: Session = Depends(get_db)
+):
+    """Create a new admin user (this should be restricted in production)"""
+    # In production, this should be protected and only accessible by super admins
+    # Check if username already exists
+    existing_admin = db.query(Admin).filter(Admin.username == admin_data.username).first()
+    if existing_admin:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already registered"
+        )
+    
+    # Create new admin
+    # In a real scenario, you would hash the password
+    new_admin = Admin(
+        username=admin_data.username,
+        hashed_password=admin_data.password,  # Should be hashed in production
+        is_superadmin=admin_data.is_superadmin
+    )
+    
+    db.add(new_admin)
+    db.commit()
+    
+    return {"message": "Admin created successfully"}
+
+@app.post("/admin/login")
+def admin_login(
+    username: str,
+    password: str,
+    db: Session = Depends(get_db)
+):
+    """Admin login endpoint"""
+    admin = db.query(Admin).filter(Admin.username == username).first()
+    
+    if not admin or admin.hashed_password != password:  # Should compare hashed passwords in production
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Create access token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": username, "is_admin": True, "is_superadmin": admin.is_superadmin},
+        expires_delta=access_token_expires,
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
+
+@app.get("/admin/patients", response_model=List[PatientResponse])
+def get_all_patients(
+    current_admin: Admin = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Get all patients (admin only)"""
+    patients = db.query(Patient).all()
+    return patients
+
+@app.get("/admin/appointments", response_model=List[AppointmentResponse])
+def get_all_appointments(
+    current_admin: Admin = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """Get all appointments (admin only)"""
+    appointments = db.query(Appointment).all()
+    return appointments
+
+# Create initial data for testing
+@app.on_event("startup")
+def create_initial_data():
+    db = SessionLocal()
+    try:
+        # Check if there are any doctors
+        doctor_count = db.query(Doctor).count()
+        if doctor_count == 0:
+            # Create sample doctors
+            doctors = [
+                Doctor(name="Dr. John Smith", specialization="Dentist"),
+                Doctor(name="Dr. Sarah Johnson", specialization="Orthodontist"),
+                Doctor(name="Dr. Michael Brown", specialization="Periodontist")
+            ]
+            db.add_all(doctors)
+            db.commit()
+            logger.info("Created sample doctors")
+        
+        # Check if there are any admins
+        admin_count = db.query(Admin).count()
+        if admin_count == 0:
+            # Create default admin
+            admin = Admin(
+                username="admin",
+                hashed_password="admin123",  # Should be hashed in production
+                is_superadmin=True
+            )
+            db.add(admin)
+            db.commit()
+            logger.info("Created default admin user")
+            
+    except Exception as e:
+        logger.error(f"Error creating initial data: {str(e)}")
+    finally:
+        db.close()
+
+# Run with: uvicorn main:app --reload
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
